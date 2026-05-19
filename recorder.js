@@ -227,8 +227,8 @@ cyberBanner();
 
 const accountsList = [
   'haverri_sp', 'kozak696990', 'itskingmafia', 'cashmoneyotr', 'medii_iiseni',
-  'diamanti_bluofficial', '', 'greca99', 'fire.fire9', 'ols_nazari',
-  'kozak.megalluks69', 'edlirhalilaj', 'klajdi_tt3', 'babaimnp0', '',
+  'Aleks_visha1124', '', 'greca99', 'fire.fire9', 'ols_nazari',
+  'kozak.megalluks69', 'edlirhalilaj', 'klajdi_tt3', 'babaimnp0', 'kleviscelaj7',
   '', '', '', '', '',
   '', '', '', '', ''
 ];
@@ -253,6 +253,8 @@ const timestampRestartWindowMs = parseDurationMs(process.env.TIMESTAMP_RESTART_W
 const restartOnBetterQuality = !/^(0|false|no|off)$/i.test(String(process.env.RESTART_ON_BETTER_QUALITY || '1'));
 const betterQualityRestartCooldownMs = parseDurationMs(process.env.BETTER_QUALITY_RESTART_COOLDOWN || '60s', 60 * 1000);
 const streamFormatPreference = String(process.env.TIKTOK_STREAM_FORMAT || 'flv').trim().toLowerCase();
+const ffmpegCookieMode = String(process.env.FFMPEG_COOKIE_MODE || 'never').trim().toLowerCase();
+const ffmpegHeaderMaxBytes = Math.max(1024, parseInt(process.env.FFMPEG_HEADER_MAX_BYTES || '7000', 10) || 7000);
 const defaultTikTokCookieFile = path.resolve('tiktok_cookies.txt');
 const tiktokCookieFile = (process.env.TIKTOK_COOKIE_FILE || (fs.existsSync(defaultTikTokCookieFile) ? defaultTikTokCookieFile : '')).trim();
 const tiktokCookieReloadIntervalMs = parseDurationMs(process.env.TIKTOK_COOKIE_RELOAD_INTERVAL || '30s', 30 * 1000);
@@ -264,6 +266,7 @@ cyberPanel('RUNTIME CONFIG', [
   ['Offline checks', offlineConfirmationChecks],
   ['Stream format', streamFormatPreference],
   ['Lookup order', 'cookies first, public fallback'],
+  ['FFmpeg cookies', ffmpegCookieMode],
   ['Restart on stream change', restartOnStreamChange ? 'enabled' : 'disabled'],
   ['Restart on better quality', restartOnBetterQuality ? 'enabled' : 'disabled'],
   ['Cookie source', process.env.TIKTOK_COOKIE ? 'TIKTOK_COOKIE env' : tiktokCookieFile || 'not configured']
@@ -796,6 +799,23 @@ function getTikTokCookieHeader(options = {}) {
   }
 }
 
+function shouldSendCookiesToFfmpeg(headersWithoutCookie, cookieHeader) {
+  if (!cookieHeader) {
+    return false;
+  }
+
+  if (/^(0|false|no|off|never)$/i.test(ffmpegCookieMode)) {
+    return false;
+  }
+
+  if (/^(1|true|yes|on|always)$/i.test(ffmpegCookieMode)) {
+    return true;
+  }
+
+  const headersWithCookie = [...headersWithoutCookie, `Cookie: ${cookieHeader}`].join('\r\n') + '\r\n';
+  return Buffer.byteLength(headersWithCookie, 'utf8') <= ffmpegHeaderMaxBytes;
+}
+
 function getFfmpegInputOptions(username) {
   const uniqueId = username.startsWith('@') ? username.slice(1) : username;
   const referer = `https://www.tiktok.com/@${uniqueId}/live`;
@@ -806,8 +826,11 @@ function getFfmpegInputOptions(username) {
     `Referer: ${referer}`
   ];
   const cookieHeader = getTikTokCookieHeader();
-  if (cookieHeader) {
+  if (shouldSendCookiesToFfmpeg(headers, cookieHeader)) {
     headers.push(`Cookie: ${cookieHeader}`);
+  } else if (cookieHeader && !getFfmpegInputOptions.warnedCookieSkip) {
+    console.log(yellow + '⚠️ Not sending TikTok cookies to FFmpeg. Direct stream URLs are signed, and large cookie headers can make FFmpeg fail with "overlong headers". Set FFMPEG_COOKIE_MODE=always only if a stream requires cookies.' + reset);
+    getFfmpegInputOptions.warnedCookieSkip = true;
   }
 
   return [
@@ -1012,8 +1035,13 @@ function startRecording(username, streamUrl) {
       const currentState = getRecordingState(username);
       if (currentState && !currentState.errorState.unsupportedCodecDetected) {
         currentState.errorState.unsupportedCodecDetected = true;
-        console.log(red + `[ffmpeg] ERROR: ${username} stream uses a codec this FFmpeg cannot read. Stopping this recording. Install a newer FFmpeg, or use a non-hd5/non-H.265 stream URL.` + reset);
-        stopRecording({ username });
+        const failedFormat = getStreamFormat(currentState.streamUrl);
+        console.log(red + `[ffmpeg] ERROR: ${username} stream uses a codec this FFmpeg cannot read. Avoiding ${failedFormat.toUpperCase()} temporarily and retrying with another stream URL.` + reset);
+        temporarilyBlockStreamFormat(username, failedFormat, 'unsupported video codec');
+        if (currentState.streamSource === 'public page') {
+          blockPublicStreamUrlSource(username, 'unsupported video codec');
+        }
+        stopRecording({ restart: true, username });
       }
       return;
     }
@@ -1543,6 +1571,28 @@ function getStreamQualityRank(streamUrl) {
   return 20;
 }
 
+function getStreamCompatibilityPenalty(streamUrl) {
+  if (!ffmpegLooksOld || getStreamFormat(streamUrl) !== 'flv') {
+    return 0;
+  }
+
+  const pathname = getStreamPathname(streamUrl).toLowerCase();
+  if (/_hd5\.flv(?:$|\?)/i.test(pathname)) {
+    return 150;
+  }
+
+  const hasKnownH264Quality = /(?:_|-)(?:or\d+|hd|sd|ld)(?=(?:\.flv|\/))/i.test(pathname);
+  if (!hasKnownH264Quality && /\/game\/.*\.flv$/i.test(pathname)) {
+    return 120;
+  }
+
+  if (!hasKnownH264Quality) {
+    return 80;
+  }
+
+  return 0;
+}
+
 function getStreamFormatRank(streamUrl) {
   const lowerUrl = String(streamUrl || '').toLowerCase();
   const isFlv = /\.flv(?:\?|$)/i.test(lowerUrl);
@@ -1587,8 +1637,8 @@ function pickBestStreamUrl(urls, blockedFormats = new Set()) {
   const candidateUrls = allowedUrls.length > 0 ? allowedUrls : uniqueUrls;
 
   candidateUrls.sort((left, right) => {
-    const leftScore = getStreamFormatRank(left) + getStreamQualityRank(left);
-    const rightScore = getStreamFormatRank(right) + getStreamQualityRank(right);
+    const leftScore = getStreamFormatRank(left) + getStreamQualityRank(left) - getStreamCompatibilityPenalty(left);
+    const rightScore = getStreamFormatRank(right) + getStreamQualityRank(right) - getStreamCompatibilityPenalty(right);
     return rightScore - leftScore || right.length - left.length;
   });
 
